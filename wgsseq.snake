@@ -1,0 +1,130 @@
+import pandas as pd
+
+sample_csv = pd.read_csv('sample_sheet.csv', index_col='name')
+CONDITIONS = set(sample_csv['condition'].tolist())
+REPS = set(sample_csv['replicate'].tolist())
+
+# Rule: Main rule to run all other rules
+rule all:
+    input:
+        expand('results/{condition}_{rep}_fastqc.html', condition=CONDITIONS, rep=REPS),
+        expand('results/{condition}_{rep}.trimmed.fastq.gz', condition=CONDITIONS, rep=REPS),
+        expand('results/{condition}.sorted.bam', condition=CONDITIONS),
+        expand('results/{condition}.dedup.bam', condition=CONDITIONS),
+        expand('results/{condition}.sorted.bam.bai', condition=CONDITIONS),
+        expand('results/{condition}.vcf.gz', condition=CONDITIONS),
+        'results/multiqc_report.html'
+
+# Rule: FastQC for raw reads
+rule fastqc:
+    input:
+        'samples/{condition}_{rep}.fastq.gz'
+    output:
+        'results/{condition}_{rep}_fastqc.html'
+    threads: 16
+    conda:
+        'envs/fastqc_env.yml'
+    shell:
+        'fastqc -t {threads} -o results/ {input}'
+
+# Rule: Trimmomatic for trimming adapters and low-quality bases
+rule trimmomatic_pe:
+    input:
+        R1='samples/{condition}_R1.fastq.gz',
+        R2='samples/{condition}_R2.fastq.gz'
+    output:
+        R1='results/{condition}_R1.trimmed.fastq.gz',
+        R2='results/{condition}_R2.trimmed.fastq.gz',
+        R1_unpaired='results/{condition}_R1.unpaired.fastq.gz',
+        R2_unpaired='results/{condition}_R2.unpaired.fastq.gz'
+    params:
+        adapters='TruSeq3-PE-2.fa' 
+    threads: 16
+    conda:
+        'envs/trimmomatic_env.yml'
+    shell:
+        '''
+        trimmomatic PE -threads {threads} \
+            -phred33 \
+            {input.R1} {input.R2} \
+            {output.R1} {output.R1_unpaired} \
+            {output.R2} {output.R2_unpaired} \
+            ILLUMINACLIP:{params.adapters}:2:30:10 \
+            LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+        '''
+
+# Rule: BWA-MEM for aligning trimmed reads to reference genome
+rule bwa_mem:
+    input:
+        R1='results/{condition}_R1.trimmed.fastq.gz',
+        R2='results/{condition}_R2.trimmed.fastq.gz',
+        ref='/path/to/reference/genome.fa'
+    output:
+        'results/{condition}.sorted.bam'
+    threads: 16
+    conda:
+        'envs/bwa_env.yml'
+    shell:
+        '''
+        bwa mem -t {threads} {input.ref} {input.R1} {input.R2} | samtools view -bS - | samtools sort -@ {threads} -o {output}
+        '''
+
+# Rule: Mark duplicates using Picard
+rule mark_duplicates:
+    input:
+        'results/{condition}.sorted.bam'
+    output:
+        bam='results/{condition}.dedup.bam',
+        metrics='results/{condition}_dedup_metrics.txt'
+    threads: 16
+    conda:
+        'envs/picard_env.yml'
+    shell:
+        '''
+        picard MarkDuplicates INPUT={input} OUTPUT={output.bam} METRICS_FILE={output.metrics} REMOVE_DUPLICATES=true
+        '''
+
+# Rule: Index the deduplicated BAM file
+rule index_bam:
+    input:
+        'results/{condition}.dedup.bam'
+    output:
+        'results/{condition}.sorted.bam.bai'
+    threads: 16
+    conda:
+        'envs/samtools_env.yml'
+    shell:
+        'samtools index {input}'
+
+# Rule: Variant calling using GATK HaplotypeCaller
+rule haplotypecaller:
+    input:
+        bam='results/{condition}.dedup.bam',
+        bai='results/{condition}.sorted.bam.bai',
+        ref='/path/to/reference/genome.fa'
+    output:
+        vcf='results/{condition}.vcf.gz'
+    threads: 16
+    conda:
+        'envs/gatk_env.yml'
+    shell:
+        '''
+        gatk --java-options "-Xmx4g" HaplotypeCaller \
+            -R {input.ref} \
+            -I {input.bam} \
+            -O {output.vcf} \
+            -ERC GVCF
+        '''
+
+# Rule: Generate a MultiQC report
+rule multiqc:
+    input:
+        expand('results/{condition}_{rep}_fastqc.html', condition=CONDITIONS, rep=REPS),
+        expand('results/{condition}_dedup_metrics.txt', condition=CONDITIONS),
+        expand('results/{condition}.vcf.gz', condition=CONDITIONS)
+    output:
+        'results/multiqc_report.html'
+    conda:
+        'envs/multiqc_env.yml'
+    shell:
+        'multiqc results/ -o . -n results/multiqc_report.html'
